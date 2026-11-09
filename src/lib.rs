@@ -201,6 +201,10 @@ where
 const PAIRWISE_MAX: usize = 32;
 
 /// Returns `true` if two `Some` pointers in `ptrs` are equal.
+///
+/// A hash set was also measured and rejected: std's `HashSet` (SipHash) is
+/// slower than sorting at every size, and `FxHashSet` beats sorting only for
+/// about 64–256 keys, by ~10%, which does not justify a dependency.
 fn has_duplicates<V>(ptrs: &[Option<NonNull<V>>]) -> bool {
     if ptrs.len() <= PAIRWISE_MAX {
         // O(n²), no allocation; the same check std's `get_disjoint_mut` uses.
