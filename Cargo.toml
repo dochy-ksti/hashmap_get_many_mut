@@ -1,6 +1,6 @@
 [package]
 name = "hashmap_get_many_mut"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Get mutable references to values for a runtime-length list of keys in a std HashMap"
 license = "MIT OR Apache-2.0"
