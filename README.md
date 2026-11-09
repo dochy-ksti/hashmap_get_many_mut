@@ -41,6 +41,23 @@ assert_eq!(stock["apple"], 110);
   results but never aliasing `&mut`.
 - The duplicate check is `O(n log n)` (std's fixed-size version is `O(n²)`).
 
+### `get_many_unchecked_mut`
+
+`unsafe fn get_many_unchecked_mut` skips the duplicate check and its extra
+allocation, like std's `get_disjoint_unchecked_mut`. The caller must make sure
+that no two keys refer to the same entry; otherwise it is undefined behavior,
+even if the returned references are not used.
+
+```rust
+use std::collections::HashMap;
+use hashmap_get_many_mut::GetManyMut;
+
+let mut map = HashMap::from([("a", 1), ("b", 2), ("c", 3)]);
+
+// SAFETY: "a" and "c" are distinct, so they refer to different entries.
+let values = unsafe { map.get_many_unchecked_mut(&["a", "c"]) };
+```
+
 ## Implementation note
 
 The implementation looks up every key with `HashMap::get_mut`, keeps only raw

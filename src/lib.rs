@@ -4,7 +4,8 @@
 //! [`HashMap::get_disjoint_mut`] in std only accepts a fixed number of keys
 //! (`[&Q; N]`, where `N` must be known at compile time). This crate adds
 //! [`GetManyMut::get_many_mut`], which takes a slice of keys whose length is
-//! decided at runtime.
+//! decided at runtime, and its `unsafe` counterpart
+//! [`GetManyMut::get_many_unchecked_mut`], which skips the duplicate check.
 //!
 //! ```
 //! use std::collections::HashMap;
@@ -81,6 +82,49 @@ pub trait GetManyMut<K, V>: sealed::Sealed {
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized;
+
+    /// Like [`get_many_mut`](GetManyMut::get_many_mut), but without checking
+    /// that the keys refer to distinct entries.
+    ///
+    /// This skips the `O(n log n)` duplicate check and its extra allocation.
+    /// It is the runtime-length counterpart of
+    /// [`HashMap::get_disjoint_unchecked_mut`].
+    ///
+    /// # Safety
+    ///
+    /// No two of `keys` may refer to the same entry in the map. Calling this
+    /// method with keys that do is *[undefined behavior]* even if the
+    /// resulting references are not used.
+    ///
+    /// Repeating a key that is not in the map is fine, because every
+    /// occurrence yields `None`.
+    ///
+    /// Note that the check is about *entries*, not about how keys compare:
+    /// if the key type's `Borrow`, `Eq` or `Hash` implementations are
+    /// inconsistent, keys that look distinct may still find the same entry.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use hashmap_get_many_mut::GetManyMut;
+    ///
+    /// let mut map = HashMap::from([("a", 1), ("b", 2), ("c", 3)]);
+    ///
+    /// // SAFETY: "a" and "c" are distinct, so they refer to different entries.
+    /// let mut values = unsafe { map.get_many_unchecked_mut(&["a", "c"]) };
+    /// for value in values.iter_mut().flatten() {
+    ///     **value *= 10;
+    /// }
+    ///
+    /// assert_eq!(map["a"], 10);
+    /// assert_eq!(map["b"], 2);
+    /// assert_eq!(map["c"], 30);
+    /// ```
+    ///
+    /// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
+    unsafe fn get_many_unchecked_mut<Q>(&mut self, keys: &[&Q]) -> Vec<Option<&mut V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized;
 }
 
 impl<K, V, S> GetManyMut<K, V> for HashMap<K, V, S>
@@ -93,48 +137,76 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        // Collect everything first, holding only raw pointers while looking up.
-        // If we created `&mut V` while continuing to look up, a later `get_mut`
-        // could read an earlier entry through a shared reference while probing,
-        // invalidating the `&mut V` handed out before (UB under Stacked Borrows;
-        // `tests::with_hash_collisions` makes Miri detect this).
-        //
-        // This relies on `HashMap::get_mut` not moving or writing to entries
-        // other than the one it returns. std does not document this, but its
-        // implementation (hashbrown) never relocates entries on lookup.
-        let ptrs: Vec<Option<NonNull<V>>> = keys
-            .iter()
-            .map(|&key| self.get_mut(key).map(NonNull::from))
-            .collect();
+        let ptrs = lookup_ptrs(self, keys);
 
-        if ptrs.len() >= 2 {
-            // Detect duplicates by address, not by key (`Q: Eq`).
-            // `Borrow`, `Eq` and `Hash` are safe traits and may be implemented
-            // incorrectly; relying on them could hand out aliasing `&mut V`.
-            let mut sorted: Vec<NonNull<V>> = ptrs.iter().flatten().copied().collect();
-            sorted.sort_unstable();
-            assert!(
-                sorted.windows(2).all(|w| w[0] != w[1]),
-                "get_many_mut: duplicate keys"
-            );
-        }
+        // Detect duplicates by address, not by key (`Q: Eq`).
+        // `Borrow`, `Eq` and `Hash` are safe traits and may be implemented
+        // incorrectly; relying on them could hand out aliasing `&mut V`.
+        let mut sorted: Vec<NonNull<V>> = ptrs.iter().flatten().copied().collect();
+        sorted.sort_unstable();
+        assert!(
+            sorted.windows(2).all(|w| w[0] != w[1]),
+            "get_many_mut: duplicate keys"
+        );
 
-        // Option<NonNull<V>> and Option<&mut V> have the same layout, so this
-        // collect reuses `ptrs`' allocation (std's in-place collect
-        // optimization; not guaranteed, but no new allocation happens today).
-        ptrs.into_iter()
-            .map(|p| {
-                p.map(|mut p| {
-                    // SAFETY: every pointer refers to a distinct entry (checked
-                    // by address above), each came from `get_mut` on `self`,
-                    // which is borrowed mutably for the returned lifetime, and
-                    // `self` is not accessed again here, so no `&mut V`
-                    // created below can be invalidated or aliased.
-                    unsafe { p.as_mut() }
-                })
-            })
-            .collect()
+        // SAFETY: every pointer refers to a distinct entry (checked by address
+        // above) and came from `lookup_ptrs` on `self`, which stays mutably
+        // borrowed for the returned lifetime and is not accessed again.
+        unsafe { into_mut_refs(ptrs) }
     }
+
+    unsafe fn get_many_unchecked_mut<Q>(&mut self, keys: &[&Q]) -> Vec<Option<&mut V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let ptrs = lookup_ptrs(self, keys);
+
+        // SAFETY: the caller guarantees that no two keys refer to the same
+        // entry. The pointers came from `lookup_ptrs` on `self`, which stays
+        // mutably borrowed for the returned lifetime and is not accessed again.
+        unsafe { into_mut_refs(ptrs) }
+    }
+}
+
+/// Looks up every key and returns pointers to the found values.
+///
+/// Everything is collected before any `&mut V` is created, holding only raw
+/// pointers while looking up. If we created `&mut V` while continuing to look
+/// up, a later `get_mut` could read an earlier entry through a shared reference
+/// while probing, invalidating the `&mut V` handed out before (UB under Stacked
+/// Borrows; `tests::with_hash_collisions` makes Miri detect this).
+///
+/// This relies on `HashMap::get_mut` not moving or writing to entries other
+/// than the one it returns. std does not document this, but its implementation
+/// (hashbrown) never relocates entries on lookup.
+fn lookup_ptrs<K, V, S, Q>(map: &mut HashMap<K, V, S>, keys: &[&Q]) -> Vec<Option<NonNull<V>>>
+where
+    K: Eq + Hash + Borrow<Q>,
+    Q: Hash + Eq + ?Sized,
+    S: BuildHasher,
+{
+    keys.iter()
+        .map(|&key| map.get_mut(key).map(NonNull::from))
+        .collect()
+}
+
+/// Turns the pointers from [`lookup_ptrs`] into mutable references.
+///
+/// `Option<NonNull<V>>` and `Option<&mut V>` have the same layout, so this
+/// collect reuses `ptrs`' allocation (std's in-place collect optimization; not
+/// guaranteed, but no new allocation happens today).
+///
+/// # Safety
+///
+/// - No two `Some` pointers may be equal.
+/// - Every pointer must come from [`lookup_ptrs`] on a map that stays mutably
+///   borrowed for `'a` and is not accessed through any other path meanwhile.
+unsafe fn into_mut_refs<'a, V>(ptrs: Vec<Option<NonNull<V>>>) -> Vec<Option<&'a mut V>> {
+    ptrs.into_iter()
+        // SAFETY: guaranteed by the caller (see `# Safety` above).
+        .map(|p| p.map(|mut p| unsafe { p.as_mut() }))
+        .collect()
 }
 
 #[cfg(test)]
@@ -314,6 +386,63 @@ mod tests {
 
             // Write only after all references were obtained; Miri reports
             // here if any of them was invalidated.
+            for value in values.iter_mut().flatten() {
+                **value += 10;
+            }
+
+            assert_eq!(map["a"], 10);
+            assert_eq!(map["b"], 11);
+            assert_eq!(map["c"], 12);
+        }
+    }
+
+    #[test]
+    fn unchecked_success_and_missing_keys() {
+        let mut map = sample();
+        // SAFETY: "c" and "a" are distinct; "x" is missing and may repeat.
+        let mut values = unsafe { map.get_many_unchecked_mut(&["x", "c", "x", "a"]) };
+        assert!(values[0].is_none());
+        assert!(values[2].is_none());
+
+        for value in values.iter_mut().flatten() {
+            **value += 100;
+        }
+
+        assert_eq!(map["a"], 101);
+        assert_eq!(map["b"], 2);
+        assert_eq!(map["c"], 103);
+    }
+
+    #[test]
+    fn unchecked_empty() {
+        let mut map = sample();
+        // SAFETY: no keys, so no overlap.
+        assert!(unsafe { map.get_many_unchecked_mut::<str>(&[]) }.is_empty());
+    }
+
+    /// Same as `with_hash_collisions`, for the unchecked version: it shares the
+    /// lookup code, so it must not invalidate earlier references either.
+    #[test]
+    fn unchecked_with_hash_collisions() {
+        let orders = [
+            ["a", "b", "c", "x"],
+            ["c", "b", "a", "x"],
+            ["b", "x", "c", "a"],
+        ];
+
+        for keys in orders {
+            let mut map: HashMap<String, i32, ConstState> = HashMap::with_hasher(ConstState);
+            map.insert("a".to_string(), 0);
+            map.insert("b".to_string(), 1);
+            map.insert("c".to_string(), 2);
+
+            // SAFETY: all keys are distinct.
+            let mut values = unsafe { map.get_many_unchecked_mut(&keys) };
+
+            for (key, value) in keys.iter().zip(&values) {
+                assert_eq!(value.is_some(), *key != "x");
+            }
+
             for value in values.iter_mut().flatten() {
                 **value += 10;
             }
