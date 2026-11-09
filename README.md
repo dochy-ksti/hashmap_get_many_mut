@@ -39,12 +39,13 @@ assert_eq!(stock["apple"], 110);
 - Duplicates are detected by the entries' **addresses**, not by comparing
   keys, so incorrect `Eq` / `Hash` / `Borrow` implementations can give wrong
   results but never aliasing `&mut`.
-- The duplicate check is `O(n log n)` (std's fixed-size version is `O(n²)`).
+- The duplicate check compares every pair for up to 32 keys (`O(n²)`, no
+  allocation, nearly free for a few keys) and sorts the addresses for more
+  (`O(n log n)`, one extra allocation).
 
 ### `get_many_unchecked_mut`
 
-`unsafe fn get_many_unchecked_mut` skips the duplicate check and its extra
-allocation, like std's `get_disjoint_unchecked_mut`. The caller must make sure
+`unsafe fn get_many_unchecked_mut` skips the duplicate check, like std's `get_disjoint_unchecked_mut`. The caller must make sure
 that no two keys refer to the same entry; otherwise it is undefined behavior,
 even if the returned references are not used.
 
