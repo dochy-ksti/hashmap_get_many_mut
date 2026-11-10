@@ -4,8 +4,9 @@
 //! [`HashMap::get_disjoint_mut`] in std only accepts a fixed number of keys
 //! (`[&Q; N]`, where `N` must be known at compile time). This crate adds
 //! [`GetManyMut::get_many_mut`], which takes a slice of keys whose length is
-//! decided at runtime, and its `unsafe` counterpart
-//! [`GetManyMut::get_many_unchecked_mut`], which skips the duplicate check.
+//! decided at runtime. [`GetManyMut::try_get_many_mut`] returns an error
+//! instead of panicking on duplicate keys, and the `unsafe`
+//! [`GetManyMut::get_many_unchecked_mut`] skips the duplicate check.
 //!
 //! ```
 //! use std::collections::HashMap;
@@ -35,6 +36,8 @@
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::ptr::NonNull;
 
@@ -64,6 +67,10 @@ pub trait GetManyMut<K, V>: sealed::Sealed {
     /// occurrence just yields `None`), which matches
     /// [`HashMap::get_disjoint_mut`].
     ///
+    /// If the keys come from outside the program (e.g. user input) and
+    /// duplicates should be handled rather than panic, use
+    /// [`try_get_many_mut`](GetManyMut::try_get_many_mut).
+    ///
     /// ```should_panic
     /// use std::collections::HashMap;
     /// use hashmap_get_many_mut::GetManyMut;
@@ -83,6 +90,45 @@ pub trait GetManyMut<K, V>: sealed::Sealed {
     /// - `n > 32`: the addresses are sorted, `O(n log n)` with one extra
     ///   allocation of `n` pointers.
     fn get_many_mut<Q>(&mut self, keys: &[&Q]) -> Vec<Option<&mut V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized;
+
+    /// Like [`get_many_mut`](GetManyMut::get_many_mut), but returns an error
+    /// instead of panicking if two or more of `keys` refer to the same entry.
+    ///
+    /// On success, the `i`-th element of the returned `Vec` corresponds to
+    /// `keys[i]`, and is `None` if that key is not in the map. Repeating a
+    /// key that is not in the map is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DuplicateKeysError`] if two or more of `keys` refer to the
+    /// same entry.
+    ///
+    /// ```
+    /// use std::collections::HashMap;
+    /// use hashmap_get_many_mut::GetManyMut;
+    ///
+    /// let mut map = HashMap::from([("a", 1), ("b", 2)]);
+    ///
+    /// assert!(map.try_get_many_mut(&["a", "b", "a"]).is_err());
+    ///
+    /// let mut values = map.try_get_many_mut(&["b", "x", "a", "x"]).unwrap();
+    /// for value in values.iter_mut().flatten() {
+    ///     **value *= 10;
+    /// }
+    /// assert_eq!(map["a"], 10);
+    /// assert_eq!(map["b"], 20);
+    /// ```
+    ///
+    /// # Complexity
+    ///
+    /// The same as [`get_many_mut`](GetManyMut::get_many_mut).
+    fn try_get_many_mut<Q>(
+        &mut self,
+        keys: &[&Q],
+    ) -> Result<Vec<Option<&mut V>>, DuplicateKeysError>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized;
@@ -142,17 +188,33 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        match self.try_get_many_mut(keys) {
+            Ok(values) => values,
+            Err(_) => duplicate_keys_panic(),
+        }
+    }
+
+    fn try_get_many_mut<Q>(
+        &mut self,
+        keys: &[&Q],
+    ) -> Result<Vec<Option<&mut V>>, DuplicateKeysError>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let ptrs = lookup_ptrs(self, keys);
 
         // Detect duplicates by address, not by key (`Q: Eq`).
         // `Borrow`, `Eq` and `Hash` are safe traits and may be implemented
         // incorrectly; relying on them could hand out aliasing `&mut V`.
-        assert!(!has_duplicates(&ptrs), "get_many_mut: duplicate keys");
+        if has_duplicates(&ptrs) {
+            return Err(DuplicateKeysError { _private: () });
+        }
 
         // SAFETY: every pointer refers to a distinct entry (checked by address
         // above) and came from `lookup_ptrs` on `self`, which stays mutably
         // borrowed for the returned lifetime and is not accessed again.
-        unsafe { into_mut_refs(ptrs) }
+        Ok(unsafe { into_mut_refs(ptrs) })
     }
 
     unsafe fn get_many_unchecked_mut<Q>(&mut self, keys: &[&Q]) -> Vec<Option<&mut V>>
@@ -191,6 +253,36 @@ where
         .collect()
 }
 
+/// The error returned by [`GetManyMut::try_get_many_mut`] when two or more
+/// keys refer to the same entry in the map.
+///
+/// It does not say which keys were duplicated: reporting their positions
+/// would complicate the check for no clear benefit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DuplicateKeysError {
+    // Keeps the struct from being constructed outside this crate.
+    _private: (),
+}
+
+impl fmt::Display for DuplicateKeysError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("duplicate keys: two or more keys refer to the same entry")
+    }
+}
+
+impl Error for DuplicateKeysError {}
+
+/// The panic of [`GetManyMut::get_many_mut`], kept out of line.
+///
+/// With the `panic!` inline, `get_many_mut` measured ~5–10 ns slower for 2–8
+/// keys even without duplicates; moving it here removes that cost.
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn duplicate_keys_panic() -> ! {
+    panic!("get_many_mut: duplicate keys")
+}
+
 /// Up to this many keys, [`has_duplicates`] compares every pair instead of
 /// sorting.
 ///
@@ -202,9 +294,20 @@ const PAIRWISE_MAX: usize = 32;
 
 /// Returns `true` if two `Some` pointers in `ptrs` are equal.
 ///
-/// A hash set was also measured and rejected: std's `HashSet` (SipHash) is
-/// slower than sorting at every size, and `FxHashSet` beats sorting only for
-/// about 64–256 keys, by ~10%, which does not justify a dependency.
+/// A hash set was also measured, on shuffled pointers into a real `HashMap`
+/// as [`lookup_ptrs`] produces them, and rejected:
+///
+/// - std's `HashSet` (SipHash) is 1.6–2.8× slower than sorting at every size.
+/// - `FxHashSet` and foldhash are 1.2–1.9× faster for about 64 to 16k keys,
+///   but their timings vary with the address layout, and this check is only
+///   about a quarter of `get_many_mut` (4096 `String` keys: ~28 µs of
+///   ~118 µs), so the whole call would gain only ~10%.
+/// - From about 64k keys, sorting beats them too: the table outgrows the L2
+///   cache and every insert is a random access, while sorting mostly scans
+///   memory sequentially.
+///
+/// Benchmark with unordered pointers: `sort_unstable` runs in O(n) on input
+/// that is already sorted, which once made sorting look faster than it is.
 fn has_duplicates<V>(ptrs: &[Option<NonNull<V>>]) -> bool {
     if ptrs.len() <= PAIRWISE_MAX {
         // O(n²), no allocation; the same check std's `get_disjoint_mut` uses.
@@ -295,6 +398,69 @@ mod tests {
     }
 
     #[test]
+    fn try_success_and_missing_keys() {
+        let mut map = sample();
+        let mut values = map.try_get_many_mut(&["x", "c", "x", "a"]).unwrap();
+        assert_eq!(values.len(), 4);
+        assert!(values[0].is_none());
+        assert!(values[2].is_none());
+
+        for value in values.iter_mut().flatten() {
+            **value += 100;
+        }
+
+        assert_eq!(map["a"], 101);
+        assert_eq!(map["b"], 2);
+        assert_eq!(map["c"], 103);
+    }
+
+    #[test]
+    fn try_empty() {
+        let mut map = sample();
+        assert!(map.try_get_many_mut::<str>(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn try_duplicate_keys_error() {
+        let mut map = sample();
+        let err = map
+            .try_get_many_mut(&["x", "a", "b", "x", "a"])
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "duplicate keys: two or more keys refer to the same entry"
+        );
+
+        // The map is still usable after an error.
+        assert_eq!(map.try_get_many_mut(&["a"]).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn try_error_works_with_question_mark() {
+        fn bump(map: &mut HashMap<String, i32>, keys: &[&str]) -> Result<(), Box<dyn Error>> {
+            for value in map.try_get_many_mut(keys)?.into_iter().flatten() {
+                *value += 1;
+            }
+            Ok(())
+        }
+
+        let mut map = sample();
+        assert!(bump(&mut map, &["a", "b"]).is_ok());
+        assert!(bump(&mut map, &["a", "a"]).is_err());
+        assert_eq!(map["a"], 2);
+        assert_eq!(map["b"], 3);
+    }
+
+    #[test]
+    fn try_duplicate_keys_with_hash_collisions() {
+        let mut map: HashMap<String, i32, ConstState> = HashMap::with_hasher(ConstState);
+        map.insert("a".to_string(), 0);
+        map.insert("b".to_string(), 1);
+
+        assert!(map.try_get_many_mut(&["b", "a", "b"]).is_err());
+    }
+
+    #[test]
     fn duplicate_missing_keys_do_not_panic() {
         let mut map = sample();
         let values = map.get_many_mut(&["x", "a", "x"]);
@@ -337,6 +503,10 @@ mod tests {
                 let mut with_dup = keys.clone();
                 with_dup[pos] = dup;
                 let refs: Vec<&usize> = with_dup.iter().collect();
+
+                let err = map.try_get_many_mut(&refs);
+                assert!(err.is_err(), "n = {n}: missed duplicate {dup} at {pos}");
+
                 let result = catch_unwind(AssertUnwindSafe(|| {
                     let _ = map.get_many_mut(&refs);
                 }));

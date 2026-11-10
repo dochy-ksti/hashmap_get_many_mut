@@ -43,6 +43,25 @@ assert_eq!(stock["apple"], 110);
   allocation, nearly free for a few keys) and sorts the addresses for more
   (`O(n log n)`, one extra allocation).
 
+### `try_get_many_mut`
+
+`try_get_many_mut` returns `Err(DuplicateKeysError)` instead of panicking when
+two or more keys refer to the same entry. Use it when the keys come from
+outside the program (e.g. user input). The error implements
+`std::error::Error`, so it works with `?`.
+
+```rust
+use std::collections::HashMap;
+use hashmap_get_many_mut::GetManyMut;
+
+let mut map = HashMap::from([("a", 1), ("b", 2)]);
+
+assert!(map.try_get_many_mut(&["a", "b", "a"]).is_err());
+
+let values = map.try_get_many_mut(&["b", "a"]).unwrap();
+assert_eq!(values.len(), 2);
+```
+
 ### `get_many_unchecked_mut`
 
 `unsafe fn get_many_unchecked_mut` skips the duplicate check, like std's `get_disjoint_unchecked_mut`. The caller must make sure
